@@ -396,34 +396,41 @@ int FaceLandmarksDetNode::Feedback()
 
     // convert nv12 image to class
     std::shared_ptr<NV12PyramidInput> pyramid = nullptr;
-    pyramid =
-        hobot::dnn_node::ImageProc::GetNV12PyramidFromNV12Img(reinterpret_cast<const char *>(feed_img_bgr_nv12.data), fb_img_info_.img_h, fb_img_info_.img_w, fb_img_info_.img_h, fb_img_info_.img_w);
+    pyramid = hobot::dnn_node::ImageProc::GetNV12PyramidFromNV12Img(reinterpret_cast<const char *>(feed_img_bgr_nv12.data), fb_img_info_.img_h, fb_img_info_.img_w, fb_img_info_.img_h, fb_img_info_.img_w);
     if (!pyramid)
     {
         RCLCPP_ERROR(this->get_logger(), "=> Get Nv12 pym fail with image: %s", fb_img_info_.image.c_str());
         return -1;
     }
 
-    // set roi
-    auto rois = std::make_shared<std::vector<hbDNNRoi>>();
-    for (size_t i = 0; i < fb_img_info_.rois.size(); i++)
+    // create inference output data
+    auto dnn_output = std::make_shared<FaceLandmarksDetOutput>();
+    dnn_output->image_msg_header = std::make_shared<std_msgs::msg::Header>();
+    dnn_output->image_msg_header->set__stamp(this->get_clock()->now());
+
+    // get roi from ai_msg
+    std::shared_ptr<std::vector<hbDNNRoi>> rois = nullptr;
+    std::map<size_t, size_t> valid_roi_idx;
+    ai_msgs::msg::PerceptionTargets::UniquePtr ai_msg = nullptr;
+    if (ai_msg_manage_->GetTargetRois(dnn_output->image_msg_header->stamp, rois, valid_roi_idx, ai_msg,
+        std::bind(&FaceLandmarksDetNode::NormalizeRoi, this,
+        std::placeholders::_1, std::placeholders::_2,
+        expand_scale_, pyramid->width, pyramid->height),
+        200) < 0 || ai_msg == nullptr)
     {
-        hbDNNRoi roi;
-
-        roi.left = fb_img_info_.rois[i][0];
-        roi.top = fb_img_info_.rois[i][1];
-        roi.right = fb_img_info_.rois[i][2];
-        roi.bottom = fb_img_info_.rois[i][3];
-
-        // roi's left and top must be even, right and bottom must be odd
-        roi.left += (roi.left % 2 == 0 ? 0 : 1);
-        roi.top += (roi.top % 2 == 0 ? 0 : 1);
-        roi.right -= (roi.right % 2 == 1 ? 0 : 1);
-        roi.bottom -= (roi.bottom % 2 == 1 ? 0 : 1);
-        RCLCPP_INFO(this->get_logger(), "=> input face roi: %d %d %d %d", roi.left, roi.top, roi.right, roi.bottom);
-
-        rois->push_back(roi);
+        RCLCPP_INFO(this->get_logger(), "=> frame ts get face roi fail");
+        return -1;
     }
+    if (!rois || rois->empty() || rois->size() != valid_roi_idx.size())
+    {
+        RCLCPP_INFO(this->get_logger(), "=> frame ts has no face roi");
+        return -1;
+    }
+
+    dnn_output->valid_rois = rois;
+    dnn_output->valid_roi_idx = valid_roi_idx;
+    dnn_output->ai_msg = std::move(ai_msg);
+    dnn_output->pyramid = pyramid;
 
     // use pyramid to create DNNInput, and the inputs will be passed into the model through the RunInferTask interface.
     std::vector<std::shared_ptr<DNNInput>> inputs;
@@ -431,12 +438,6 @@ int FaceLandmarksDetNode::Feedback()
     {
         inputs.push_back(pyramid);
     }
-
-    // create ouput tensor
-    auto dnn_output = std::make_shared<FaceLandmarksDetOutput>();
-    dnn_output->valid_rois = rois;
-    dnn_output->valid_roi_idx[0] = 0;
-    dnn_output->pyramid = pyramid;
 
     // get model
     auto model_manage = GetModel();
